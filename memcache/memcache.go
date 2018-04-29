@@ -41,6 +41,10 @@ import (
 	"google.golang.org/appengine"
 	"google.golang.org/appengine/internal"
 	pb "google.golang.org/appengine/internal/memcache"
+	"google.golang.org/grpc/codes"
+
+	"go.opencensus.io/stats"
+	"go.opencensus.io/trace"
 )
 
 var (
@@ -109,13 +113,19 @@ func singleError(err error) error {
 // Get gets the item for the given key. ErrCacheMiss is returned for a memcache
 // cache miss. The key must be at most 250 bytes in length.
 func Get(c context.Context, key string) (*Item, error) {
+	c, span := trace.StartSpan(c, "appengine/memcache.Get")
+	defer span.End()
+
+	stats.Record(c, mGet.M(1))
 	m, err := GetMulti(c, []string{key})
 	if err != nil {
 		return nil, err
 	}
 	if _, ok := m[key]; !ok {
+		stats.Record(c, mCacheMiss.M(1))
 		return nil, ErrCacheMiss
 	}
+	stats.Record(c, mCacheHit.M(1))
 	return m[key], nil
 }
 
@@ -123,21 +133,34 @@ func Get(c context.Context, key string) (*Item, error) {
 // have fewer elements than the input slice, due to memcache cache misses.
 // Each key must be at most 250 bytes in length.
 func GetMulti(c context.Context, key []string) (map[string]*Item, error) {
+	c, span := trace.StartSpan(c, "appengine/memcache.GetMulti")
+	defer span.End()
+
 	if len(key) == 0 {
+		span.Annotate(nil, "Zero length key used")
+		stats.Record(c, mZeroLengthKey.M(1))
 		return nil, nil
 	}
 	keyAsBytes := make([][]byte, len(key))
+
+	span.Annotate([]trace.Attribute{
+		trace.Int64Attribute("key_length", int64(len(key))),
+	}, "Converting keys into byte slices")
+
 	for i, k := range key {
 		keyAsBytes[i] = []byte(k)
 	}
+	span.Annotate(nil, "Now issuing memcache RPC request")
 	req := &pb.MemcacheGetRequest{
 		Key:    keyAsBytes,
 		ForCas: proto.Bool(true),
 	}
 	res := &pb.MemcacheGetResponse{}
 	if err := internal.Call(c, "memcache", "Get", req, res); err != nil {
+		span.SetStatus(trace.Status{Code: int32(codes.Internal), Message: err.Error()})
 		return nil, err
 	}
+	span.Annotate(nil, "Successfully issued memcache RPC")
 	m := make(map[string]*Item, len(res.Item))
 	for _, p := range res.Item {
 		t := protoToItem(p)
@@ -150,6 +173,10 @@ func GetMulti(c context.Context, key []string) (map[string]*Item, error) {
 // ErrCacheMiss is returned if the specified item can not be found.
 // The key must be at most 250 bytes in length.
 func Delete(c context.Context, key string) error {
+	c, span := trace.StartSpan(c, "appengine/memcache.Delete")
+	defer span.End()
+	stats.Record(c, mKeyLength.M(int64(len(key))))
+
 	return singleError(DeleteMulti(c, []string{key}))
 }
 
@@ -157,7 +184,12 @@ func Delete(c context.Context, key string) error {
 // If any keys cannot be found, an appengine.MultiError is returned.
 // Each key must be at most 250 bytes in length.
 func DeleteMulti(c context.Context, key []string) error {
+	c, span := trace.StartSpan(c, "appengine/memcache.DeleteMulti")
+	defer span.End()
+
 	if len(key) == 0 {
+		span.Annotate(nil, "Zero length key used")
+		stats.Record(c, mZeroLengthKey.M(1))
 		return nil
 	}
 	req := &pb.MemcacheDeleteRequest{
@@ -200,6 +232,10 @@ func DeleteMulti(c context.Context, key []string) error {
 // populate it before the delta is applied.
 // The key must be at most 250 bytes in length.
 func Increment(c context.Context, key string, delta int64, initialValue uint64) (newValue uint64, err error) {
+	c, span := trace.StartSpan(c, "appengine/memcache.Increment")
+	defer span.End()
+	stats.Record(c, mIncrement.M(1))
+
 	return incr(c, key, delta, &initialValue)
 }
 
@@ -209,10 +245,24 @@ func Increment(c context.Context, key string, delta int64, initialValue uint64) 
 // expensive.
 // An error is returned if the specified item can not be found.
 func IncrementExisting(c context.Context, key string, delta int64) (newValue uint64, err error) {
+	c, span := trace.StartSpan(c, "appengine/memcache.IncrementExisting")
+	defer span.End()
+	stats.Record(c, mKeyLength.M(int64(len(key))))
+
 	return incr(c, key, delta, nil)
 }
 
 func incr(c context.Context, key string, delta int64, initialValue *uint64) (newValue uint64, err error) {
+	c, span := trace.StartSpan(c, "appengine/memcache.incr")
+	defer span.End()
+
+	iKeyLen := int64(len(key))
+	span.Annotate([]trace.Attribute{
+		trace.Int64Attribute("delta", delta),
+		trace.Int64Attribute("key_length", iKeyLen),
+	}, "Invoking Increment RPC")
+	stats.Record(c, mKeyLength.M(iKeyLen))
+
 	req := &pb.MemcacheIncrementRequest{
 		Key:          []byte(key),
 		InitialValue: initialValue,
@@ -225,10 +275,13 @@ func incr(c context.Context, key string, delta int64, initialValue *uint64) (new
 	}
 	res := &pb.MemcacheIncrementResponse{}
 	err = internal.Call(c, "memcache", "Increment", req, res)
+	span.Annotate(nil, "Completed Increment RPC")
 	if err != nil {
+		span.SetStatus(trace.Status{Code: int32(codes.Internal), Message: err.Error()})
 		return
 	}
 	if res.NewValue == nil {
+		stats.Record(c, mCacheMiss.M(1))
 		return 0, ErrCacheMiss
 	}
 	return *res.NewValue, nil
@@ -237,12 +290,19 @@ func incr(c context.Context, key string, delta int64, initialValue *uint64) (new
 // set sets the given items using the given conflict resolution policy.
 // appengine.MultiError may be returned.
 func set(c context.Context, item []*Item, value [][]byte, policy pb.MemcacheSetRequest_SetPolicy) error {
+	c, span := trace.StartSpan(c, "appengine/memcache.set")
+	defer span.End()
+
 	if len(item) == 0 {
+		stats.Record(c, mZeroLengthItems.M(1))
 		return nil
 	}
 	req := &pb.MemcacheSetRequest{
 		Item: make([]*pb.MemcacheSetRequest_Item, len(item)),
 	}
+	span.Annotate([]trace.Attribute{
+		trace.Int64Attribute("item_count", int64(len(item))),
+	}, "Preparing the protobuf request")
 	for i, t := range item {
 		p := &pb.MemcacheSetRequest_Item{
 			Key: []byte(t.Key),
@@ -282,24 +342,44 @@ func set(c context.Context, item []*Item, value [][]byte, policy pb.MemcacheSetR
 		p.SetPolicy = policy.Enum()
 		req.Item[i] = p
 	}
+	span.Annotate(nil, "Completed protobuf request preparation")
 	res := &pb.MemcacheSetResponse{}
-	if err := internal.Call(c, "memcache", "Set", req, res); err != nil {
+	attributes := []trace.Attribute{
+		trace.Int64Attribute("item_count", int64(len(req.Item))),
+	}
+	span.Annotate(attributes, "Invoking Set RPC")
+	err := internal.Call(c, "memcache", "Set", req, res)
+	span.Annotate(attributes, "Completed Set RPC")
+	if err != nil {
+		span.Annotate([]trace.Attribute{
+			trace.StringAttribute("error", err.Error()),
+		}, "RPC error encountered")
+		span.SetStatus(trace.Status{Code: int32(codes.Internal), Message: err.Error()})
 		return err
 	}
 	if len(res.SetStatus) != len(item) {
+		span.Annotate([]trace.Attribute{
+			trace.Int64Attribute("got:len:res.Status", int64(len(res.SetStatus))),
+			trace.Int64Attribute("want::len:item", int64(len(item))),
+		}, "Result count mismatch")
 		return ErrServerError
 	}
 	me, any := make(appengine.MultiError, len(item)), false
+	measures := make([]stats.Measurement, 0, len(res.SetStatus)*2)
 	for i, st := range res.SetStatus {
 		var err error
 		switch st {
 		case pb.MemcacheSetResponse_STORED:
 			// OK
+			measures = append(measures, mStored.M(1))
 		case pb.MemcacheSetResponse_NOT_STORED:
+			measures = append(measures, mNotStoredError.M(1))
 			err = ErrNotStored
 		case pb.MemcacheSetResponse_EXISTS:
+			measures = append(measures, mCasConflictError.M(1))
 			err = ErrCASConflict
 		default:
+			measures = append(measures, mServerError.M(1))
 			err = ErrServerError
 		}
 		if err != nil {
@@ -307,7 +387,10 @@ func set(c context.Context, item []*Item, value [][]byte, policy pb.MemcacheSetR
 			any = true
 		}
 	}
+	stats.Record(c, measures...)
+
 	if any {
+		span.SetStatus(trace.Status{Code: int32(codes.Internal), Message: me.Error()})
 		return me
 	}
 	return nil
@@ -315,25 +398,95 @@ func set(c context.Context, item []*Item, value [][]byte, policy pb.MemcacheSetR
 
 // Set writes the given item, unconditionally.
 func Set(c context.Context, item *Item) error {
+	c, span := trace.StartSpan(c, "appengine/memcache.Set")
+	defer span.End()
+
+	valueLen := int64(0)
+	keyLen := int64(0)
+	if item != nil {
+		if item.Key != "" {
+			keyLen = int64(len(item.Key))
+		}
+		if item.Value != nil {
+			valueLen = int64(len(item.Value))
+		}
+	}
+	stats.Record(c, mSet.M(1), mKeyLength.M(keyLen), mValueLength.M(valueLen))
+
 	return singleError(set(c, []*Item{item}, nil, pb.MemcacheSetRequest_SET))
 }
 
 // SetMulti is a batch version of Set.
 // appengine.MultiError may be returned.
-func SetMulti(c context.Context, item []*Item) error {
-	return set(c, item, nil, pb.MemcacheSetRequest_SET)
+func SetMulti(c context.Context, items []*Item) error {
+	c, span := trace.StartSpan(c, "appengine/memcache.SetMulti")
+	defer span.End()
+
+	measures := make([]stats.Measurement, 0, len(items)*2)
+	measures = append(measures, mSetMulti.M(1))
+	for _, item := range items {
+		valueLen := int64(0)
+		keyLen := int64(0)
+		if item != nil {
+			if item.Key != "" {
+				keyLen = int64(len(item.Key))
+			}
+			if item.Value != nil {
+				valueLen = int64(len(item.Value))
+			}
+		}
+		measures = append(measures, mKeyLength.M(keyLen), mValueLength.M(valueLen))
+	}
+	stats.Record(c, measures...)
+
+	return set(c, items, nil, pb.MemcacheSetRequest_SET)
 }
 
 // Add writes the given item, if no value already exists for its key.
 // ErrNotStored is returned if that condition is not met.
 func Add(c context.Context, item *Item) error {
+	c, span := trace.StartSpan(c, "appengine/memcache.Add")
+	defer span.End()
+
+	valueLen := int64(0)
+	keyLen := int64(0)
+	if item != nil {
+		if item.Key != "" {
+			keyLen = int64(len(item.Key))
+		}
+		if item.Value != nil {
+			valueLen = int64(len(item.Value))
+		}
+	}
+	stats.Record(c, mAdd.M(1), mKeyLength.M(keyLen), mValueLength.M(valueLen))
+
 	return singleError(set(c, []*Item{item}, nil, pb.MemcacheSetRequest_ADD))
 }
 
 // AddMulti is a batch version of Add.
 // appengine.MultiError may be returned.
-func AddMulti(c context.Context, item []*Item) error {
-	return set(c, item, nil, pb.MemcacheSetRequest_ADD)
+func AddMulti(c context.Context, items []*Item) error {
+	c, span := trace.StartSpan(c, "appengine/memcache.AddMulti")
+	defer span.End()
+
+	measures := make([]stats.Measurement, 0, len(items)*2)
+	measures = append(measures, mAddMulti.M(1))
+	for _, item := range items {
+		valueLen := int64(0)
+		keyLen := int64(0)
+		if item != nil {
+			if item.Key != "" {
+				keyLen = int64(len(item.Key))
+			}
+			if item.Value != nil {
+				valueLen = int64(len(item.Value))
+			}
+		}
+		measures = append(measures, mKeyLength.M(keyLen), mValueLength.M(valueLen))
+	}
+	stats.Record(c, measures...)
+
+	return set(c, items, nil, pb.MemcacheSetRequest_ADD)
 }
 
 // CompareAndSwap writes the given item that was previously returned by Get,
@@ -343,12 +496,31 @@ func AddMulti(c context.Context, item []*Item) error {
 // ErrCASConflict is returned if the value was modified in between the calls.
 // ErrNotStored is returned if the value was evicted in between the calls.
 func CompareAndSwap(c context.Context, item *Item) error {
+	c, span := trace.StartSpan(c, "appengine/memcache.CompareAndSwap")
+	defer span.End()
+
+	valueLen := int64(0)
+	keyLen := int64(0)
+	if item != nil {
+		if item.Key != "" {
+			keyLen = int64(len(item.Key))
+		}
+		if item.Value != nil {
+			valueLen = int64(len(item.Value))
+		}
+	}
+	stats.Record(c, mCas.M(1), mKeyLength.M(keyLen), mValueLength.M(valueLen))
+
 	return singleError(set(c, []*Item{item}, nil, pb.MemcacheSetRequest_CAS))
 }
 
 // CompareAndSwapMulti is a batch version of CompareAndSwap.
 // appengine.MultiError may be returned.
 func CompareAndSwapMulti(c context.Context, item []*Item) error {
+	c, span := trace.StartSpan(c, "appengine/memcache.CompareAndSwapMulti")
+	defer span.End()
+	stats.Record(c, mCasMulti.M(1))
+
 	return set(c, item, nil, pb.MemcacheSetRequest_CAS)
 }
 
@@ -367,17 +539,35 @@ type Codec struct {
 // ErrCacheMiss is returned for a memcache cache miss.
 // The key must be at most 250 bytes in length.
 func (cd Codec) Get(c context.Context, key string, v interface{}) (*Item, error) {
+	c, span := trace.StartSpan(c, "appengine/memcache.Codec.Get")
+	defer span.End()
+	stats.Record(c, mGet.M(1), mKeyLength.M(int64(len(key))))
+
 	i, err := Get(c, key)
+	span.Annotate(nil, "Completed Get")
 	if err != nil {
+		span.SetStatus(trace.Status{Code: int32(codes.Internal), Message: err.Error()})
 		return nil, err
 	}
-	if err := cd.Unmarshal(i.Value, v); err != nil {
+	span.Annotate(nil, "Invoking Codec.Unmarshal")
+	err = cd.Unmarshal(i.Value, v)
+	span.Annotate(nil, "Completed Codec.Unmarshal")
+	if err != nil {
+		span.Annotate(nil, "codec.UnmarshalError")
+		span.SetStatus(trace.Status{Code: int32(codes.Internal), Message: err.Error()})
 		return nil, err
 	}
 	return i, nil
 }
 
 func (cd Codec) set(c context.Context, items []*Item, policy pb.MemcacheSetRequest_SetPolicy) error {
+	c, span := trace.StartSpan(c, "appengine/memcache.Codec.set")
+	defer span.End()
+
+	span.Annotate([]trace.Attribute{
+		trace.Int64Attribute("count", int64(len(items))),
+	}, "Marshaling items")
+
 	var vs [][]byte
 	var me appengine.MultiError
 	for i, item := range items {
@@ -394,6 +584,7 @@ func (cd Codec) set(c context.Context, items []*Item, policy pb.MemcacheSetReque
 		}
 	}
 	if me != nil {
+		span.SetStatus(trace.Status{Code: int32(codes.Unknown), Message: me.Error()})
 		return me
 	}
 
@@ -402,24 +593,94 @@ func (cd Codec) set(c context.Context, items []*Item, policy pb.MemcacheSetReque
 
 // Set writes the given item, unconditionally.
 func (cd Codec) Set(c context.Context, item *Item) error {
+	c, span := trace.StartSpan(c, "appengine/memcache.Set")
+	defer span.End()
+
+	valueLen := int64(0)
+	keyLen := int64(0)
+	if item != nil {
+		if item.Key != "" {
+			keyLen = int64(len(item.Key))
+		}
+		if item.Value != nil {
+			valueLen = int64(len(item.Value))
+		}
+	}
+	stats.Record(c, mSet.M(1), mKeyLength.M(keyLen), mValueLength.M(valueLen))
+
 	return singleError(cd.set(c, []*Item{item}, pb.MemcacheSetRequest_SET))
 }
 
 // SetMulti is a batch version of Set.
 // appengine.MultiError may be returned.
 func (cd Codec) SetMulti(c context.Context, items []*Item) error {
+	c, span := trace.StartSpan(c, "appengine/memcache.SetMulti")
+	defer span.End()
+
+	measures := make([]stats.Measurement, 0, len(items)*2)
+	measures = append(measures, mSetMulti.M(1))
+	for _, item := range items {
+		valueLen := int64(0)
+		keyLen := int64(0)
+		if item != nil {
+			if item.Key != "" {
+				keyLen = int64(len(item.Key))
+			}
+			if item.Value != nil {
+				valueLen = int64(len(item.Value))
+			}
+		}
+		measures = append(measures, mKeyLength.M(keyLen), mValueLength.M(valueLen))
+	}
+	stats.Record(c, measures...)
+
 	return cd.set(c, items, pb.MemcacheSetRequest_SET)
 }
 
 // Add writes the given item, if no value already exists for its key.
 // ErrNotStored is returned if that condition is not met.
 func (cd Codec) Add(c context.Context, item *Item) error {
+	c, span := trace.StartSpan(c, "appengine/memcache.Add")
+	defer span.End()
+
+	valueLen := int64(0)
+	keyLen := int64(0)
+	if item != nil {
+		if item.Key != "" {
+			keyLen = int64(len(item.Key))
+		}
+		if item.Value != nil {
+			valueLen = int64(len(item.Value))
+		}
+	}
+	stats.Record(c, mAdd.M(1), mKeyLength.M(keyLen), mValueLength.M(valueLen))
+
 	return singleError(cd.set(c, []*Item{item}, pb.MemcacheSetRequest_ADD))
 }
 
 // AddMulti is a batch version of Add.
 // appengine.MultiError may be returned.
 func (cd Codec) AddMulti(c context.Context, items []*Item) error {
+	c, span := trace.StartSpan(c, "appengine/memcache.AddMulti")
+	defer span.End()
+
+	measures := make([]stats.Measurement, 0, len(items)*2)
+	measures = append(measures, mAddMulti.M(1))
+	for _, item := range items {
+		valueLen := int64(0)
+		keyLen := int64(0)
+		if item != nil {
+			if item.Key != "" {
+				keyLen = int64(len(item.Key))
+			}
+			if item.Value != nil {
+				valueLen = int64(len(item.Value))
+			}
+		}
+		measures = append(measures, mKeyLength.M(keyLen), mValueLength.M(valueLen))
+	}
+	stats.Record(c, measures...)
+
 	return cd.set(c, items, pb.MemcacheSetRequest_ADD)
 }
 
@@ -430,12 +691,47 @@ func (cd Codec) AddMulti(c context.Context, items []*Item) error {
 // ErrCASConflict is returned if the value was modified in between the calls.
 // ErrNotStored is returned if the value was evicted in between the calls.
 func (cd Codec) CompareAndSwap(c context.Context, item *Item) error {
+	c, span := trace.StartSpan(c, "appengine/memcache.CompareAndSwap")
+	defer span.End()
+
+	valueLen := int64(0)
+	keyLen := int64(0)
+	if item != nil {
+		if item.Key != "" {
+			keyLen = int64(len(item.Key))
+		}
+		if item.Value != nil {
+			valueLen = int64(len(item.Value))
+		}
+	}
+	stats.Record(c, mCas.M(1), mKeyLength.M(keyLen), mValueLength.M(valueLen))
+
 	return singleError(cd.set(c, []*Item{item}, pb.MemcacheSetRequest_CAS))
 }
 
 // CompareAndSwapMulti is a batch version of CompareAndSwap.
 // appengine.MultiError may be returned.
 func (cd Codec) CompareAndSwapMulti(c context.Context, items []*Item) error {
+	c, span := trace.StartSpan(c, "appengine/memcache.CompareAndSwapMulti")
+	defer span.End()
+
+	measures := make([]stats.Measurement, 0, len(items)*2)
+	measures = append(measures, mCasMulti.M(1))
+	for _, item := range items {
+		valueLen := int64(0)
+		keyLen := int64(0)
+		if item != nil {
+			if item.Key != "" {
+				keyLen = int64(len(item.Key))
+			}
+			if item.Value != nil {
+				valueLen = int64(len(item.Value))
+			}
+		}
+		measures = append(measures, mKeyLength.M(keyLen), mValueLength.M(valueLen))
+	}
+	stats.Record(c, measures...)
+
 	return cd.set(c, items, pb.MemcacheSetRequest_CAS)
 }
 
@@ -473,12 +769,21 @@ type Statistics struct {
 
 // Stats retrieves the current memcache statistics.
 func Stats(c context.Context) (*Statistics, error) {
+	c, span := trace.StartSpan(c, "appengine/memcache.Stats")
+	defer span.End()
+	stats.Record(c, mStats.M(1))
+
 	req := &pb.MemcacheStatsRequest{}
 	res := &pb.MemcacheStatsResponse{}
-	if err := internal.Call(c, "memcache", "Stats", req, res); err != nil {
+	span.Annotate(nil, "Invoking the Stats RPC")
+	err := internal.Call(c, "memcache", "Stats", req, res)
+	span.Annotate(nil, "Completed the Stats RPC")
+	if err != nil {
+		span.SetStatus(trace.Status{Code: int32(codes.Internal), Message: err.Error()})
 		return nil, err
 	}
 	if res.Stats == nil {
+		span.SetStatus(trace.Status{Code: int32(codes.NotFound), Message: "No stats found"})
 		return nil, ErrNoStats
 	}
 	return &Statistics{
@@ -493,9 +798,20 @@ func Stats(c context.Context) (*Statistics, error) {
 
 // Flush flushes all items from memcache.
 func Flush(c context.Context) error {
+	c, span := trace.StartSpan(c, "appengine/memcache.Flush")
+	defer span.End()
+	stats.Record(c, mFlush.M(1))
+
 	req := &pb.MemcacheFlushRequest{}
 	res := &pb.MemcacheFlushResponse{}
-	return internal.Call(c, "memcache", "FlushAll", req, res)
+	span.Annotate(nil, "Invoking the Flush RPC")
+	err := internal.Call(c, "memcache", "FlushAll", req, res)
+	span.Annotate(nil, "Completed the Flush RPC")
+	if err != nil {
+		span.SetStatus(trace.Status{Code: int32(codes.Internal), Message: err.Error()})
+		return err
+	}
+	return nil
 }
 
 func namespaceMod(m proto.Message, namespace string) {
